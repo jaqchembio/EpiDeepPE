@@ -1,0 +1,329 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+This notebook demonstrates the model generation scheme I used. Most of the models I generated used the caret package which is a suite of predictive models.
+```{r}
+library(keras) # for deep learning
+library(tidyverse) # general utility functions
+library(caret) # machine learning utility functions
+library(pls)
+library(corrplot)
+```
+Preprocessing Data
+
+The data from my dataframe assembled from the ENCODE data and subsequent processing in python is uploaded and split into separate training and testing sets. I resplit the data for the most promising models to evaluate their performance on differenct training/testing splits. In this case, 20% of the original dataset was withheld for validation.
+```{r}
+myDeepPE <- read.csv('/Users/jackqueenan/Desktop/CompBio\ MIT\ 6.047/1130DeepPE_input_full.csv', stringsAsFactors = FALSE)
+
+myDeepPE[6:43] <- as.data.frame(lapply(myDeepPE[6:43], normalize))
+
+# Split the data into training and test randomly
+ind <- sample(2, nrow(myDeepPE), replace=TRUE, prob=c(0.8, 0.2))
+myDeepPE.training <- myDeepPE[ind==1, 6:44]
+myDeepPE.test <- myDeepPE[ind==2, 6:44]
+
+myDeepPE.trainingtarget <- myDeepPE[ind==1, 44]
+myDeepPE.testtarget <- myDeepPE[ind==2, 44]
+
+oldDeepPE.training <- myDeepPE[ind==1, c(6:25,44)]
+oldDeepPE.test <- myDeepPE[ind==2, c(6:25,44)]
+oldDeepPE.trainingtarget <- myDeepPE.trainingtarget
+oldDeepPE.testtarget <- myDeepPE.testtarget
+write.csv(x=myDeepPE[ind==1, c(2,5:25,44)],file="training_partition_oldDeepPE.csv")
+write.csv(x=myDeepPE[ind==2, c(2,5:25,44)],file="test_partition_oldDeepPE.csv")
+```
+
+Min-max normalization retains the original distribution of scores except for a scaling factor and transforms all the scores into a common range [0, 1]. However, this method is not robust (i.e., the method is highly sensitive to outliers. Neural networks are especially sensitive to un-normalized data, but this means the output retains the normalized structure. I thereforee created a function to translate the normalized output back into meaningful un-normalized PE efficiency metric.
+```{r}
+
+# MAX-MIN NORMALIZATION
+normalize <- function(x) {
+  num <- x - min(x)
+  denom <- max(x) - min(x)
+  return (num/denom)
+}
+
+denormalize<- function(normx,x) {
+  denom <- max(x) - min(x)
+  return ((normx*denom)+min(x))
+}
+
+```
+It is important to check that there is no significant correlation between any of the epigenetic variables I added to the dataset. To do this, monitor the relationshipi between variables using pairwise correlation matrix below.
+```{r}
+pairs(~. , data=myDeepPE.training[21:31], cex=.1)    # Apply corrplot function
+```
+
+
+Save function adds predicted test data for given model to a csv file that keeps a log of all unique models tested. Models that output normalized values instead of PE efficiency undergo an additional denormalization in the second function below. 
+```{r}
+save_prediction <- function(model,data){
+  predictionA = predict(model, data)
+  df_predictionsA <- read.csv('/Users/jackqueenan/Desktop/CompBio\ MIT\ 6.047/model_predictions.csv', stringsAsFactors = FALSE)
+  df_predictionsA[deparse(substitute(model))]=predictionA
+  write.csv(x=df_predictionsA, file = "model_predictions.csv", row.names = FALSE)
+}
+
+save_denorm_prediction <- function(model,data,origdata){
+  predictionA = predict(model, data)
+  df_predictionsA <- read.csv('/Users/jackqueenan/Desktop/CompBio\ MIT\ 6.047/model_predictions.csv', stringsAsFactors = FALSE)
+  k=denormalize(predictionA,origdata)
+  df_predictionsA[deparse(substitute(model))]=k
+  write.csv(x=df_predictionsA, file = "model_predictions.csv", row.names = FALSE)
+}
+```
+Model generation overview:
+Predictive models were generated first using the training data with all epigenetic variables scraped from ENCODE datasets. Then these models were compared to their counterparts which were modeled using just the control non-epigenetic variables. Both the model performance (quantified by RMSE and R squared) and the change over the smaller, control input dataset (same variables normalized to the model using the control imput) are used to evaulate the models. 
+
+
+Random Forest models:
+```{r}
+myControl = trainControl(method = "cv", number = 5, verboseIter = FALSE)
+
+#Develop model on my dataset which includes ENCODE data
+model_RF10 = train(Measured.PE.efficiency ~ ., 
+              data = myDeepPE.training,
+              tuneLength = 10,
+              method = "ranger",
+              importance = 'impurity',
+              trControl = myControl)
+save_prediction(model_RFbase,myDeepPE.test)
+model_RF10
+
+#Compare my data set to paper's smaller data set without epigenetic parameters
+myControl = trainControl(method = "cv", number = 5, verboseIter = FALSE)
+model_RF10_paper = train(Measured.PE.efficiency ~ ., 
+              data = oldDeepPE.training,
+              tuneLength = 10,
+              method = "ranger",
+              importance = 'impurity',
+              trControl = myControl)
+save_prediction(model_RF10_paper,oldDeepPE.test)
+model_RF10_paper
+```
+
+Normalize for more variables by taking only top 20
+```{r}
+plot(varImp(model_PCR), main="xgb - Variable Importance",cex=1.0)
+```
+
+```{r}
+Top20Variables = c("OverallQual", "GrLivArea"...) #List the top 20 vars from above
+train_Top20Var = select(myDeepPE.training, one_of(Top20Variables, "Meeasured.PE.efficiency")) #Subset original dataframe with the top 20 vars
+```
+
+```{r}
+model_rf_Top20 = train(Measured.PE.efficiency ~ ., 
+                  data = train_Top20Var,
+                  tuneLength = 1,
+                  method = "ranger",
+                  importance = 'impurity',
+                  trControl = myControl)
+```
+
+Linear regression model
+```{r}
+model_glmboost = train(Measured.PE.efficiency ~ ., 
+                  data = myDeepPE.training,
+                  method = "glmboost",
+                  trControl = myControl)
+save_prediction(model_glmboost,myDeepPE.test)
+
+model_glmboost_paper = train(Measured.PE.efficiency ~ ., 
+                  data = oldDeepPE.training,
+                  method = "glmboost",
+                  trControl = myControl)
+save_prediction(model_glmboost_paper,myDeepPE.test)
+```
+
+NNET
+```{r}
+mlp_grid =expand.grid(size=14,decay=0.00005)
+
+#Make separate datasets that contain a normalized Measured PE efficiency variable. This is only needed for nnets
+myDeepPE.training.normout<-myDeepPE.training
+myDeepPE.training.normout[39] <- as.data.frame(lapply(myDeepPE.training.normout[39], normalize))
+myDeepPE.test.normout<-myDeepPE.test
+myDeepPE.test.normout[39] <- as.data.frame(lapply(myDeepPE.test.normout[39], normalize))
+
+#Model with expanded dataset
+myControl = trainControl(method = "cv", number = 5, verboseIter = FALSE)
+model_mlpML10.4 <- train(Measured.PE.efficiency ~.,data = myDeepPE.training.normout,
+                   trControl = myControl, 
+                   method = "nnet",
+                   #preProc =  c('center', 'scale', 'knnImpute', 'pca'),
+                   #decay = 1E-5,
+                   #tuneLength=10,
+                   verbose=FALSE,
+                   tuneGrid = mlp_grid
+                   )
+save_denorm_prediction(model_mlpML10.4,myDeepPE.test.normout,myDeepPE.test)
+model_mlpML10.4
+
+#Useful to compare the model performance of two models and determine when one is sufficient to save to the model log
+a<-data_frame(predict(model_mlpML10.3,myDeepPE.test.normout))
+b<-data_frame(predict(model_mlpML10.4,myDeepPE.test.normout))
+c<-myDeepPE.test.normout[39]
+postResample(a,c)
+postResample(b,c)
+
+#Control dataset
+mlp_grid = t.grid=expand.grid(size=7,decay=0.0001)
+
+oldDeepPE.training.normout<-oldDeepPE.training
+oldDeepPE.training.normout[21] <- as.data.frame(lapply(oldDeepPE.training.normout[21], normalize))
+oldDeepPE.test.normout<-oldDeepPE.test
+oldDeepPE.test.normout[21] <- as.data.frame(lapply(oldDeepPE.test.normout[21], normalize))
+
+myControl = trainControl(method = "cv", number = 5, verboseIter = FALSE)
+model_mlpML10_paper <- train(Measured.PE.efficiency ~.,data = oldDeepPE.training.normout,
+                   trControl = myControl, 
+                   method = "nnet",
+                   #preProc =  c('center', 'scale', 'knnImpute', 'pca'),
+                   #decay = 1E-5,
+                   #tuneLength=10,
+                   verbose=FALSE,
+                   tuneGrid = mlp_grid)
+save_denorm_prediction(model_mlpML10_paper,oldDeepPE.test.normout,oldDeepPE.test)
+#model_mlpML10
+```
+
+Support Vector Machines
+```{r}
+model_SVM_paper = train(Measured.PE.efficiency ~ ., 
+                  data = oldDeepPE.training,
+                  method = "svmLinear",
+                  trControl = myControl)
+save_prediction(model_SVM_paper,oldDeepPE.test)
+model_SVM_paper
+```
+
+Principal Component Regression
+```{r}
+model_PCR_paper = train(Measured.PE.efficiency ~ ., 
+                  data = oldDeepPE.training[:,1:2138],
+                  method = "pcr",
+                  trControl = myControl)
+save_prediction(model_PCR_paper,oldDeepPE.test)
+model_PCR_paper
+
+model_PCR= train(Measured.PE.efficiency ~ ., 
+                  data = myDeepPE.training[:,1:2138],
+                  method = "pcr",
+                  trControl = myControl)
+save_prediction(model_PCR,myDeepPE.test)
+model_PCR
+```
+
+Basic Multivariable Linear Regression
+```{r}
+model_lm_paper = train(Measured.PE.efficiency ~ ., 
+                  data = oldDeepPE.training,
+                  method = "lm",
+                  trControl = myControl)
+save_prediction(model_lm_paper,oldDeepPE.test)
+model_lm_paper
+```
+
+XGBoost
+```{r}
+library(xgboost)
+train<-as.matrix(oldDeepPE.training[1:20])
+label<-as.matrix(oldDeepPE.training[21])
+
+model_xgb.3_paper <-
+  xgboost(
+    data = train,
+    label = label,
+    nrounds = 2000,
+    objective = "reg:squarederror",
+    early_stopping_rounds = 3,
+    max_depth = 10,
+    eta = .1
+  ) 
+save_prediction(model_xgb.3_paper,as.matrix(oldDeepPE.test[1:20]))
+```
+
+Bagged MARS using gCV Pruning (method = 'bagEarthGCV')
+
+For classification and regression using package earth with tuning parameters: Product Degree (degree, numeric)
+
+Note: Unlike other packages used by train, the earth package is fully loaded when this model is used.
+```{r}
+model_lBag_paper = train(Measured.PE.efficiency ~ ., 
+                  data = oldDeepPE.training,
+                  method = "bagEarthGCV",
+                  trControl = myControl)
+save_prediction(model_lBag_paper,oldDeepPE.test)
+
+model_lBag = train(Measured.PE.efficiency ~ ., 
+                  data = myDeepPE.training,
+                  method = "bagEarthGCV",
+                  trControl = myControl)
+save_prediction(model_lBag,myDeepPE.test)
+```
+
+Bayes Regularized Neural Network (method='brnn')
+```{r}
+
+library(brnn)
+model_brnn_paper = train(Measured.PE.efficiency ~ ., 
+                  data = oldDeepPE.training.normout,
+                  method = "brnn",
+                  trControl = myControl)
+save_denorm_prediction(model_brnn_paper,oldDeepPE.test.normout,oldDeepPE.test)
+
+model_brnn = train(Measured.PE.efficiency ~ ., 
+                  data = myDeepPE.training.normout,
+                  method = "brnn",
+                  trControl = myControl)
+save_denorm_prediction(model_brnn,myDeepPE.test.normout,myDeepPE.test)
+```
+
+Bayesian Ridge Regression (method='bridge')
+```{r}
+library(monomvn)
+model_bridge_paper = train(Measured.PE.efficiency ~ ., 
+                  data = oldDeepPE.training,
+                  method = "bridge",
+                  trControl = myControl)
+save_prediction(model_bridge_paper,oldDeepPE.test)
+
+model_bridge = train(Measured.PE.efficiency ~ ., 
+                  data = myDeepPE.training,
+                  method = "bridge",
+                  trControl = myControl)
+save_prediction(model_bridge,myDeepPE.test)
+```
+
+Model comparison:
+
+To visualize the RMSE of various models based on their internally sampled RMSE, plot the results together. Note, nnets and methods that used normalized outputs will return biased RMSE since their outputs are smaller by definition.
+```{r}
+model_list <- list(rf1 = model_RF1, rf10 = model_RF10, rf1Paper=model_RF1_paper, rf10Paper=model_RF10_paper, glm=model_glmboost, glmPaper=model_glmboost_paper, lBag=model_lBag, lBagPaper=model_lBag_paper, lm=model_lm, lmPaper=model_lm_paper, SVM=model_SVM, SVMPaper=model_SVM_paper)
+resamples = resamples(model_list)
+#summary(resamples)
+bwplot(resamples, metric = "RMSE")
+```
+
+Plot regression:
+
+To visualize the trend in predicted vs obsereved data, use the following code chunk. This plots overlays the scatteplot of all test data with the y=x regression line and/or the linear regression trendline. Note significant divergence of the linear regression trendline  from y=x suggests model inaccuracy. 
+```{r}
+library(car)
+
+df_preds <- read.csv('/Users/jackqueenan/Desktop/CompBio\ MIT\ 6.047/model_predictions.csv')
+x1=as.matrix(df_preds$X)
+y1=as.matrix(df_preds$model_xgb)
+plot(x1,y1, pch=3, main="RF10",xlab = "Measured PE efficiency (%)", ylab = "Predicted PE Efficiency (%)")
+
+mod_intercept_1 <- lm(I(y) ~ x)  
+abline(lm(I(y1-intercept)~0+x1), col="red") # regression line (y~x)
+lines(y1,y1, col="blue") # regression line (y~x)
+
+```
